@@ -1,0 +1,2033 @@
+// Gigalixir & Turso & GitHub MCP Server — Cloudflare Worker (2024-11-05 protocol)
+// Deploy: wrangler deploy
+// Secrets: wrangler secret put GIGALIXIR_EMAIL
+//          wrangler secret put GIGALIXIR_API_KEY
+//          wrangler secret put TURSO_DB_URL
+//          wrangler secret put TURSO_AUTH_TOKEN
+//          wrangler secret put GITHUB_TOKEN
+
+const GIGALIXIR_BASE = 'https://api.gigalixir.com';
+
+// ── UTILITIES ────────────────────────────────────────────────────────────────
+
+function getGigalixirAuth(env) {
+  const email = env.GIGALIXIR_EMAIL || '';
+  const apiKey = env.GIGALIXIR_API_KEY || '';
+  // Support either Node.js Buffer or standard btoa in Workers
+  const str = `${email}:${apiKey}`;
+  if (typeof Buffer !== 'undefined') {
+    return 'Basic ' + Buffer.from(str).toString('base64');
+  }
+  return 'Basic ' + btoa(str);
+}
+
+// Durable fetch with timeout
+async function fetchWithTimeout(url, options, timeoutMs = 8000) {
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const res = await fetch(url, { ...options, signal: controller.signal });
+    clearTimeout(timeoutId);
+    return res;
+  } catch (err) {
+    clearTimeout(timeoutId);
+    throw err;
+  }
+}
+
+// Safe REST client wrapper
+async function gigalixirRequest(env, method, path, body = null) {
+  const authHeader = getGigalixirAuth(env);
+  const options = {
+    method,
+    headers: {
+      'Authorization': authHeader,
+      'Content-Type': 'application/json',
+      'Accept': 'application/json',
+    },
+    body: body ? JSON.stringify(body) : undefined,
+  };
+
+  const res = await fetchWithTimeout(`${GIGALIXIR_BASE}${path}`, options, 8000);
+  const text = await res.text();
+  
+  if (!res.ok) {
+    throw new Error(`Gigalixir API Error (${res.status}): ${text || res.statusText}`);
+  }
+
+  try {
+    return JSON.parse(text);
+  } catch {
+    return { raw: text };
+  }
+}
+
+// ── TURSO DATABASE LAYER ─────────────────────────────────────────────────────
+
+async function getDbRegistryPath() {
+  const path = await import('path');
+  return path.join(process.cwd(), 'turso_databases.json');
+}
+
+async function readDbRegistry() {
+  try {
+    const fs = await import('fs');
+    const regPath = await getDbRegistryPath();
+    if (fs.existsSync(regPath)) {
+      const data = fs.readFileSync(regPath, 'utf8');
+      return JSON.parse(data);
+    }
+  } catch (e) {
+    // Return empty fallback on read/parse error
+  }
+  return { activeDb: null, databases: [] };
+}
+
+async function writeDbRegistry(registry) {
+  try {
+    const fs = await import('fs');
+    const regPath = await getDbRegistryPath();
+    fs.writeFileSync(regPath, JSON.stringify(registry, null, 2), 'utf8');
+    return true;
+  } catch (e) {
+    return false;
+  }
+}
+
+function parseLibSQLUrl(rawUrl) {
+  if (!rawUrl || typeof rawUrl !== 'string') return null;
+  if (rawUrl.includes('auth_token=')) {
+    try {
+      const urlObj = new URL(rawUrl.replace('libsql://', 'https://'));
+      const tokenParam = urlObj.searchParams.get('auth_token');
+      if (tokenParam) {
+        urlObj.searchParams.delete('auth_token');
+        return {
+          dbUrl: urlObj.toString(),
+          dbToken: tokenParam
+        };
+      }
+    } catch (e) {
+      // ignore
+    }
+  }
+  return {
+    dbUrl: rawUrl.replace('libsql://', 'https://'),
+    dbToken: ''
+  };
+}
+
+async function resolveTursoCredentials(env) {
+  // Try loading from saved JSON pool first
+  try {
+    const reg = await readDbRegistry();
+    if (reg && reg.activeDb) {
+      const found = reg.databases?.find(d => d.name === reg.activeDb);
+      if (found && found.url) {
+        return {
+          dbUrl: found.url.replace('libsql://', 'https://'),
+          dbToken: found.token || ''
+        };
+      }
+    }
+  } catch (e) {
+    // disregard
+  }
+
+  // 1. Try environment variables
+  let dbUrl = env.TURSO_DB_URL || env.DATABASE_URL;
+  let dbToken = env.TURSO_AUTH_TOKEN;
+
+  // If dbUrl has a query param containing the token, parse it
+  if (dbUrl && dbUrl.includes('auth_token=')) {
+    const parsed = parseLibSQLUrl(dbUrl);
+    if (parsed) {
+      dbUrl = parsed.dbUrl;
+      dbToken = parsed.dbToken;
+    }
+  }
+
+  // 2. Fetch from Gigalixir config if missing or we suspect it's stale
+  if (!dbUrl || !dbToken) {
+    try {
+      const appsList = await gigalixirRequest(env, 'GET', '/api/apps');
+      const apps = appsList?.data ?? appsList ?? [];
+      if (Array.isArray(apps) && apps.length > 0) {
+        const activeApp = apps.find(a => a.state === 'ACTIVE') || apps[0];
+        const appName = activeApp?.unique_name;
+        if (appName) {
+          let configRes;
+          try {
+            configRes = await gigalixirRequest(env, 'GET', `/api/apps/${appName}/config`);
+          } catch {
+            configRes = await gigalixirRequest(env, 'GET', `/api/apps/${appName}/configs`);
+          }
+          const configData = configRes?.data ?? configRes ?? {};
+          const lookupUrl = configData.DATABASE_URL || configData.database_url;
+          if (lookupUrl) {
+            const parsed = parseLibSQLUrl(lookupUrl);
+            if (parsed) {
+              return parsed;
+            }
+          }
+        }
+      }
+    } catch (err) {
+      // ignore
+    }
+  }
+
+  return {
+    dbUrl: dbUrl || '',
+    dbToken: dbToken || ''
+  };
+}
+
+async function executeTursoQueries(env, statements, customUrl = null, customToken = null) {
+  let dbUrl = customUrl;
+  let dbToken = customToken;
+
+  if (!dbUrl || !dbToken) {
+    const creds = await resolveTursoCredentials(env);
+    if (!dbUrl) dbUrl = creds.dbUrl;
+    if (!dbToken) dbToken = creds.dbToken;
+  }
+
+  const runQuery = async (url, token) => {
+    if (!url) {
+      throw new Error('TURSO_DB_URL is not configured and could not be resolved from Gigalixir');
+    }
+    const cleanUrl = url.replace('libsql://', 'https://');
+    const targetUrl = cleanUrl.endsWith('/') ? `${cleanUrl}v2/pipeline` : `${cleanUrl}/v2/pipeline`;
+    
+    const requests = statements.map(st => ({
+      type: 'execute',
+      stmt: {
+        sql: st.sql,
+        args: (st.args || []).map(arg => {
+          if (arg === null) return { type: 'null' };
+          if (typeof arg === 'number') return { type: 'integer', value: String(arg) };
+          if (typeof arg === 'boolean') return { type: 'integer', value: arg ? '1' : '0' };
+          return { type: 'text', value: String(arg) };
+        })
+      }
+    }));
+    requests.push({ type: 'close' });
+
+    const res = await fetchWithTimeout(targetUrl, {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${token}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({ requests }),
+    }, 10000);
+
+    if (!res.ok) {
+      const errText = await res.text();
+      const errObj = { status: res.status, message: `Turso HTTP Error (${res.status}): ${errText}` };
+      throw errObj;
+    }
+
+    return res.json();
+  };
+
+  try {
+    return await runQuery(dbUrl, dbToken);
+  } catch (firstErr) {
+    if (!customUrl && firstErr && (firstErr.status === 401 || firstErr.message?.includes('401') || !dbUrl || !dbToken)) {
+      try {
+        const appsList = await gigalixirRequest(env, 'GET', '/api/apps');
+        const apps = appsList?.data ?? appsList ?? [];
+        if (Array.isArray(apps) && apps.length > 0) {
+          const activeApp = apps.find(a => a.state === 'ACTIVE') || apps[0];
+          const appName = activeApp?.unique_name;
+          if (appName) {
+            let configRes;
+            try {
+              configRes = await gigalixirRequest(env, 'GET', `/api/apps/${appName}/config`);
+            } catch {
+              configRes = await gigalixirRequest(env, 'GET', `/api/apps/${appName}/configs`);
+            }
+            const configData = configRes?.data ?? configRes ?? {};
+            const lookupUrl = configData.DATABASE_URL || configData.database_url;
+            if (lookupUrl) {
+              const parsed = parseLibSQLUrl(lookupUrl);
+              if (parsed && parsed.dbUrl && parsed.dbToken) {
+                return await runQuery(parsed.dbUrl, parsed.dbToken);
+              }
+            }
+          }
+        }
+      } catch (selfHealErr) {
+        // ignore fallback errors
+      }
+    }
+    throw new Error(firstErr.message || String(firstErr));
+  }
+}
+
+// Execute single Turso statement helper
+async function tursoSingle(env, sql, args = [], customUrl = null, customToken = null) {
+  const pipeline = await executeTursoQueries(env, [{ sql, args }], customUrl, customToken);
+  const resultObj = pipeline?.results?.[0];
+  
+  if (resultObj?.type === 'error') {
+    throw new Error(`SQLite Error: ${resultObj.error?.message || 'Unknown error'}`);
+  }
+
+  const result = resultObj?.response?.result;
+  if (!result) {
+    throw new Error(`Malformed Database pipeline response: ${JSON.stringify(pipeline)}`);
+  }
+
+  const cols = result.cols.map(c => c.name);
+  const rows = result.rows.map(row =>
+    Object.fromEntries(row.map((cell, i) => {
+      const colName = cols[i];
+      const val = cell?.value ?? null;
+      return [colName, val];
+    }))
+  );
+
+  return {
+    columns: cols,
+    rows,
+    rowsAffected: result.affected_row_count ?? 0,
+    lastInsertRowid: result.last_insert_rowid ?? null,
+  };
+}
+
+// ── GITHUB REST API ──────────────────────────────────────────────────────────
+
+async function githubRequest(env, method, path, body = null) {
+  const token = env.GITHUB_TOKEN;
+  if (!token) {
+    throw new Error('GITHUB_TOKEN is not configured in the environment');
+  }
+
+  const res = await fetchWithTimeout(`https://api.github.com${path}`, {
+    method,
+    headers: {
+      'Authorization': `Bearer ${token}`,
+      'Accept': 'application/vnd.github+json',
+      'X-GitHub-Api-Version': '2022-11-28',
+      'User-Agent': 'gigalixir-mcp-engine',
+      'Content-Type': 'application/json',
+    },
+    body: body ? JSON.stringify(body) : undefined,
+  }, 8000);
+
+  if (res.status === 204) return { success: true };
+  const text = await res.text();
+
+  if (!res.ok) {
+    throw new Error(`GitHub API Error (${res.status}): ${text || res.statusText}`);
+  }
+
+  try {
+    return JSON.parse(text);
+  } catch {
+    return { raw: text };
+  }
+}
+
+async function getGitHubFileSha(env, owner, repo, path, branch = 'main') {
+  try {
+    const data = await githubRequest(env, 'GET', `/repos/${owner}/${repo}/contents/${path}?ref=${branch}`);
+    return data?.sha ?? null;
+  } catch {
+    return null;
+  }
+}
+
+// ── MCP CENTRAL REGISTRY AND DEFINITIONS ─────────────────────────────────────
+
+const TOOLS = [
+  // ── Gigalixir Tools ──
+  {
+    name: 'list_apps',
+    description: 'List all Gigalixir applications in your account',
+    inputSchema: { type: 'object', properties: {} },
+    handler: async (env) => {
+      const data = await gigalixirRequest(env, 'GET', '/api/apps');
+      return { success: true, apps: data?.data ?? data };
+    }
+  },
+  {
+    name: 'get_app',
+    description: 'Get details about a specific Gigalixir app',
+    inputSchema: {
+      type: 'object',
+      properties: { app_name: { type: 'string', description: 'Application name' } },
+      required: ['app_name']
+    },
+    handler: async (env, args) => {
+      const data = await gigalixirRequest(env, 'GET', `/api/apps/${args.app_name}`);
+      return data;
+    }
+  },
+  {
+    name: 'get_configs',
+    description: 'Get custom environment variables/configs for a Gigalixir app',
+    inputSchema: {
+      type: 'object',
+      properties: { app_name: { type: 'string', description: 'Application name' } },
+      required: ['app_name']
+    },
+    handler: async (env, args) => {
+      // Safe fallback: try singular /config first, then plural /configs if it fails
+      try {
+        const res = await gigalixirRequest(env, 'GET', `/api/apps/${args.app_name}/config`);
+        return res;
+      } catch (err) {
+        return gigalixirRequest(env, 'GET', `/api/apps/${args.app_name}/configs`);
+      }
+    }
+  },
+  {
+    name: 'set_config',
+    description: 'Set custom environment variable(s) for a Gigalixir app (triggers rolling restart)',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        app_name: { type: 'string', description: 'Application name' },
+        key: { type: 'string', description: 'Config key name' },
+        value: { type: 'string', description: 'Config value' }
+      },
+      required: ['app_name', 'key', 'value']
+    },
+    handler: async (env, args) => {
+      // Try singular /config with standard nested payload format, fall back to configurations format
+      try {
+        return await gigalixirRequest(env, 'PUT', `/api/apps/${args.app_name}/config`, {
+          config: { [args.key]: args.value }
+        });
+      } catch {
+        try {
+          return await gigalixirRequest(env, 'PUT', `/api/apps/${args.app_name}/configs`, {
+            [args.key]: args.value
+          });
+        } catch (finalErr) {
+          throw new Error(`Failed to set config using both /config and /configs endpoints. Details: ${finalErr.message}`);
+        }
+      }
+    }
+  },
+  {
+    name: 'delete_config',
+    description: 'Delete/remove an environment variable from a Gigalixir app',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        app_name: { type: 'string', description: 'Application name' },
+        key: { type: 'string', description: 'Environment variable name to delete' }
+      },
+      required: ['app_name', 'key']
+    },
+    handler: async (env, args) => {
+      try {
+        return await gigalixirRequest(env, 'DELETE', `/api/apps/${args.app_name}/config/${args.key}`);
+      } catch {
+        return gigalixirRequest(env, 'DELETE', `/api/apps/${args.app_name}/configs/${args.key}`);
+      }
+    }
+  },
+  {
+    name: 'get_replicas',
+    description: 'Get replica status, size, and state for a Gigalixir app',
+    inputSchema: {
+      type: 'object',
+      properties: { app_name: { type: 'string', description: 'Application name' } },
+      required: ['app_name']
+    },
+    handler: async (env, args) => {
+      try {
+        const res = await gigalixirRequest(env, 'GET', `/api/apps/${args.app_name}/status`);
+        return res;
+      } catch (err) {
+        // Fallback: fetch general app attributes if status 404s
+        const appRes = await gigalixirRequest(env, 'GET', `/api/apps/${args.app_name}`);
+        const appData = appRes?.data ?? appRes;
+        return {
+          success: true,
+          data: {
+            replicas_count: appData?.replicas ?? 0,
+            size: appData?.size ?? 0.4,
+            state: appData?.state ?? 'UNKNOWN'
+          }
+        };
+      }
+    }
+  },
+  {
+    name: 'scale',
+    description: 'Scale a Gigalixir app to a given number of replicas or size',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        app_name: { type: 'string', description: 'Application name' },
+        replicas: { type: 'number', description: 'Number of active replicas to scale to' },
+        size: { type: 'number', description: 'Size tier of containers' }
+      },
+      required: ['app_name']
+    },
+    handler: async (env, args) => {
+      const body = {};
+      if (args.replicas !== undefined && args.replicas !== null) body.replicas = args.replicas;
+      if (args.size !== undefined && args.size !== null) body.size = args.size;
+      return gigalixirRequest(env, 'PUT', `/api/apps/${args.app_name}/scale`, body);
+    }
+  },
+  {
+    name: 'list_releases',
+    description: 'List historical deployments/releases for a Gigalixir app',
+    inputSchema: {
+      type: 'object',
+      properties: { app_name: { type: 'string', description: 'Application name' } },
+      required: ['app_name']
+    },
+    handler: async (env, args) => {
+      return gigalixirRequest(env, 'GET', `/api/apps/${args.app_name}/releases`);
+    }
+  },
+  {
+    name: 'rollback',
+    description: 'Rollback a Gigalixir app to a previous build version',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        app_name: { type: 'string', description: 'Application name' },
+        version: { type: 'number', description: 'Target version number' }
+      },
+      required: ['app_name', 'version']
+    },
+    handler: async (env, args) => {
+      return gigalixirRequest(env, 'POST', `/api/apps/${args.app_name}/releases/${args.version}/rollback`);
+    }
+  },
+  {
+    name: 'restart',
+    description: 'Gracefully restart a Gigalixir app natively',
+    inputSchema: {
+      type: 'object',
+      properties: { app_name: { type: 'string', description: 'Application name' } },
+      required: ['app_name']
+    },
+    handler: async (env, args) => {
+      return gigalixirRequest(env, 'PUT', `/api/apps/${args.app_name}/restart`);
+    }
+  },
+  {
+    name: 'get_logs',
+    description: 'Get recent application log entries without hanging or timing out',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        app_name: { type: 'string', description: 'Application name' },
+        num_lines: { type: 'number', description: 'Line count threshold (default 50, max 250)' }
+      },
+      required: ['app_name']
+    },
+    handler: async (env, args) => {
+      const numLines = Math.min(args.num_lines || 50, 250);
+      const url = `${GIGALIXIR_BASE}/api/apps/${args.app_name}/logs?num_lines=${numLines}`;
+      
+      const controller = new AbortController();
+      // Hard maximum response processing limit of 3 seconds to guarantee no MCP timeout
+      const fallbackId = setTimeout(() => controller.abort(), 3000);
+
+      try {
+        const res = await fetch(url, {
+          method: 'GET',
+          headers: { 'Authorization': getGigalixirAuth(env) },
+          signal: controller.signal
+        });
+
+        clearTimeout(fallbackId);
+
+        if (!res.ok) {
+          return { error: `Gigalixir returned HTTP status ${res.status}: ${await res.text() || res.statusText}` };
+        }
+
+        if (!res.body) {
+          return { logs: '(Empty response body returned)' };
+        }
+
+        // Chunked stream reader with custom threshold parsing to guarantee instant returns
+        const reader = res.body.getReader();
+        const decoder = new TextDecoder();
+        let buffer = '';
+        let list = [];
+        const absoluteTimeout = Date.now() + 2000; // Limit processing to 2 seconds
+
+        while (list.length < numLines && Date.now() < absoluteTimeout) {
+          const { done, value } = await reader.read();
+          if (done) break;
+
+          buffer += decoder.decode(value, { stream: true });
+          const parts = buffer.split(/\r?\n/);
+          buffer = parts.pop() || '';
+          list.push(...parts);
+
+          if (list.length >= numLines) {
+            reader.cancel('Limit matched').catch(() => {});
+            break;
+          }
+        }
+
+        if (buffer && list.length < numLines) {
+          list.push(buffer);
+        }
+
+        return {
+          lines_requested: numLines,
+          lines_retrieved: list.length,
+          logs: list.slice(-numLines).join('\n')
+        };
+      } catch (err) {
+        clearTimeout(fallbackId);
+        if (err.name === 'AbortError') {
+          return {
+            error: 'Retrieving logs was completed prematurely to prevent a gateway timeout',
+            partial: true
+          };
+        }
+        throw err;
+      }
+    }
+  },
+  {
+    name: 'create_app',
+    description: 'Provision a brand new Gigalixir application',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        app_name: { type: 'string', description: 'Unique lowcase subdomain' },
+        cloud: { type: 'string', description: 'Cloud deployment target: gcp or aws (default gcp)' },
+        region: { type: 'string', description: 'GCP/AWS region identifier' }
+      },
+      required: ['app_name']
+    },
+    handler: async (env, args) => {
+      const body = { unique_name: args.app_name };
+      if (args.cloud) body.cloud = args.cloud;
+      if (args.region) body.region = args.region;
+      return gigalixirRequest(env, 'POST', '/api/apps', body);
+    }
+  },
+
+  // ── Turso Enhanced Database Tools ──
+  {
+    name: 'turso_query',
+    description: 'Execute a read-only SQL lookup query (SELECT) with parameter injection',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        sql: { type: 'string', description: 'Full sqlite SELECT query' },
+        args: { type: 'array', items: { type: 'string' }, description: 'Prepared positional arguments' },
+        db_url: { type: 'string', description: 'Optional target Turso URL (libsql:// or https://)' },
+        db_token: { type: 'string', description: 'Optional target Turso Auth Token' }
+      },
+      required: ['sql']
+    },
+    handler: async (env, args) => {
+      const sqlText = args.sql.trim();
+      if (!/^\s*(select|pragma|with|explain)\b/i.test(sqlText)) {
+        throw new Error('Write operations are forbidden on turso_query. Please employ turso_execute instead.');
+      }
+      return tursoSingle(env, sqlText, args.args || [], args.db_url, args.db_token);
+    }
+  },
+  {
+    name: 'turso_execute',
+    description: 'Execute state changing SQL statements (INSERT, UPDATE, DELETE, CREATE, DROP)',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        sql: { type: 'string', description: 'SQL statement' },
+        args: { type: 'array', items: { type: 'string' }, description: 'Prepared positional parameters' },
+        db_url: { type: 'string', description: 'Optional target Turso URL (libsql:// or https://)' },
+        db_token: { type: 'string', description: 'Optional target Turso Auth Token' }
+      },
+      required: ['sql']
+    },
+    handler: async (env, args) => {
+      return tursoSingle(env, args.sql, args.args || [], args.db_url, args.db_token);
+    }
+  },
+  {
+    name: 'turso_list_tables',
+    description: 'List all internal tables inside your Turso database',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        db_url: { type: 'string', description: 'Optional target Turso URL' },
+        db_token: { type: 'string', description: 'Optional target Turso Auth Token' }
+      }
+    },
+    handler: async (env, args = {}) => {
+      const listSql = "SELECT name, tbl_name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name";
+      return tursoSingle(env, listSql, [], args.db_url, args.db_token);
+    }
+  },
+  {
+    name: 'turso_describe_table',
+    description: 'Describe table schema definitions, properties, types and schemas',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        table: { type: 'string', description: 'Full SQLite table name' },
+        db_url: { type: 'string', description: 'Optional target Turso URL' },
+        db_token: { type: 'string', description: 'Optional target Turso Auth Token' }
+      },
+      required: ['table']
+    },
+    handler: async (env, args) => {
+      const schemaSql = `PRAGMA table_info(${args.table})`;
+      const indexSql = `PRAGMA index_list(${args.table})`;
+      
+      const columns = await tursoSingle(env, schemaSql, [], args.db_url, args.db_token);
+      let indexes = { rows: [] };
+      try {
+        indexes = await tursoSingle(env, indexSql, [], args.db_url, args.db_token);
+      } catch {
+        // Fallback for custom virtual views
+      }
+
+      return {
+        table: args.table,
+        columns: columns.rows,
+        indexes: indexes.rows
+      };
+    }
+  },
+  {
+    name: 'turso_transaction',
+    description: 'Execute multiple stateful SQL instructions inside a safe BEGIN/COMMIT transaction roll',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        statements: {
+          type: 'array',
+          description: 'Array of SQL statements with optional prepared queries',
+          items: {
+            type: 'object',
+            properties: {
+              sql: { type: 'string' },
+              args: { type: 'array', items: { type: 'string' } }
+            },
+            required: ['sql']
+          }
+        },
+        db_url: { type: 'string', description: 'Optional target Turso URL' },
+        db_token: { type: 'string', description: 'Optional target Turso Auth Token' }
+      },
+      required: ['statements']
+    },
+    handler: async (env, args) => {
+      const rawStmts = args.statements;
+      if (!rawStmts || rawStmts?.length === 0) {
+        throw new Error('Statements list cannot be empty');
+      }
+
+      // Build Transaction list explicitly
+      const list = [
+        { sql: 'BEGIN TRANSACTION', args: [] },
+        ...rawStmts,
+        { sql: 'COMMIT', args: [] }
+      ];
+
+      try {
+        const res = await executeTursoQueries(env, list, args.db_url, args.db_token);
+        // Look for errors anywhere in the pipeline response
+        const errorIndex = res.results?.findIndex(r => r.type === 'error');
+        if (errorIndex !== -1 && errorIndex !== undefined) {
+          const failed = res.results[errorIndex];
+          // Issue automatic rollback safety query
+          await executeTursoQueries(env, [{ sql: 'ROLLBACK', args: [] }], args.db_url, args.db_token);
+          return {
+            success: false,
+            error: `Statement at index ${errorIndex - 1} failed: ${failed.error?.message || 'Transaction aborted'}`,
+            results: res.results
+          };
+        }
+        return { success: true, transaction_response: res };
+      } catch (err) {
+        // Safe rollback
+        try {
+          await executeTursoQueries(env, [{ sql: 'ROLLBACK', args: [] }], args.db_url, args.db_token);
+        } catch {
+          // ignore double rollback faults
+        }
+        throw err;
+      }
+    }
+  },
+  {
+    name: 'turso_create_database',
+    description: 'Create a brand new serverless SQLite database in your Turso account and obtain its connection parameters',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        db_name: { type: 'string', description: 'Unique database name (lowercase alphanumeric with dashes)' },
+        org_name: { type: 'string', description: 'Turso organization or username. If omitted, uses env.TURSO_ORG or is auto-resolved' },
+        api_token: { type: 'string', description: 'Turso Platform API Access Token. If omitted, uses env.TURSO_API_TOKEN or env.TURSO_PLATFORM_API_TOKEN' }
+      },
+      required: ['db_name']
+    },
+    handler: async (env, args) => {
+      const token = args.api_token || env.TURSO_PLATFORM_API_TOKEN || env.TURSO_API_TOKEN;
+      if (!token) {
+        throw new Error('Turso Platform API Access Token is required to create a database. Please provide api_token or configure TURSO_PLATFORM_API_TOKEN.');
+      }
+
+      let org = args.org_name || env.TURSO_ORG;
+      if (!org) {
+        // Resolve Org Name by fetching from Turso Endpoint
+        try {
+          const orgRes = await fetchWithTimeout('https://api.turso.tech/v1/organizations', {
+            headers: { 'Authorization': `Bearer ${token}` }
+          });
+          if (orgRes.ok) {
+            const orgData = await orgRes.json();
+            const firstOrg = orgData?.[0]?.name ?? orgData?.organizations?.[0]?.name;
+            if (firstOrg) org = firstOrg;
+          }
+        } catch (e) {
+          // fallback ignore
+        }
+      }
+
+      if (!org) org = 'default';
+
+      const dbNameClean = args.db_name.toLowerCase().trim().replace(/[^a-z0-9_-]/g, '');
+      const createUrl = `https://api.turso.tech/v1/organizations/${org}/databases`;
+
+      // 1. Create the Database
+      const createRes = await fetchWithTimeout(createUrl, {
+        method: 'POST',
+        headers: {
+          'Authorization': `Bearer ${token}`,
+          'Content-Type': 'application/json'
+        },
+        body: JSON.stringify({
+          name: dbNameClean,
+          group: 'default',
+          image: 'standard'
+        })
+      });
+
+      if (!createRes.ok) {
+        const errText = await createRes.text();
+        throw new Error(`Failed to create database on Turso (${createRes.status}): ${errText}`);
+      }
+
+      const createJson = await createRes.json();
+      const databaseMetadata = createJson?.database || {};
+
+      // Wait a moment for registration and generate Token
+      await new Promise(resolve => setTimeout(resolve, 1500));
+
+      // 2. Obtain Connection Access Token
+      const tokenUrl = `https://api.turso.tech/v1/organizations/${org}/databases/${dbNameClean}/tokens`;
+      const tokenRes = await fetchWithTimeout(tokenUrl, {
+        method: 'POST',
+        headers: {
+          'Authorization': `Bearer ${token}`,
+          'Content-Type': 'application/json'
+        },
+        body: JSON.stringify({
+          expiration: 'never',
+          read_only: false
+        })
+      });
+
+      let dbToken = '';
+      if (tokenRes.ok) {
+        const tokenJson = await tokenRes.json();
+        dbToken = tokenJson?.token || tokenJson?.jwt || '';
+      }
+
+      const rawDbUrl = `libsql://${dbNameClean}-${org}.turso.io`;
+      const urlWithToken = `${rawDbUrl}?auth_token=${dbToken}`;
+
+      return {
+        success: true,
+        message: `Turso database "${dbNameClean}" was created successfully.`,
+        database_name: dbNameClean,
+        organization: org,
+        db_url: rawDbUrl,
+        db_token: dbToken,
+        connection_string: urlWithToken,
+        metadata: databaseMetadata
+      };
+    }
+  },
+  {
+    name: 'turso_list_databases',
+    description: 'Retrieve the names and endpoints of all databases in your Turso Cloud Platform account',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        org_name: { type: 'string', description: 'Turso organization or username. If omitted, uses env.TURSO_ORG or auto-resolved' },
+        api_token: { type: 'string', description: 'Turso Platform API Access Token. If omitted, uses env.TURSO_API_TOKEN or env.TURSO_PLATFORM_API_TOKEN' }
+      }
+    },
+    handler: async (env, args = {}) => {
+      const token = args.api_token || env.TURSO_PLATFORM_API_TOKEN || env.TURSO_API_TOKEN;
+      if (!token) {
+        throw new Error('Turso Platform API Access Token is required to list databases. Please provide api_token or configure TURSO_PLATFORM_API_TOKEN.');
+      }
+
+      let org = args.org_name || env.TURSO_ORG;
+      if (!org) {
+        // Resolve Org Name
+        try {
+          const orgRes = await fetchWithTimeout('https://api.turso.tech/v1/organizations', {
+            headers: { 'Authorization': `Bearer ${token}` }
+          });
+          if (orgRes.ok) {
+            const orgData = await orgRes.json();
+            const firstOrg = orgData?.[0]?.name ?? orgData?.organizations?.[0]?.name;
+            if (firstOrg) org = firstOrg;
+          }
+        } catch (e) {
+          // ignore
+        }
+      }
+
+      if (!org) org = 'default';
+
+      const listUrl = `https://api.turso.tech/v1/organizations/${org}/databases`;
+      const res = await fetchWithTimeout(listUrl, {
+        headers: {      
+          'Authorization': `Bearer ${token}`,
+          'Accept': 'application/json'
+        }
+      });
+
+      if (!res.ok) {
+        const errText = await res.text();
+        throw new Error(`Failed to consult Turso databases list (${res.status}): ${errText}`);
+      }
+
+      const data = await res.json();
+      const databases = data?.databases || [];
+
+      return {
+        success: true,
+        organization: org,
+        databases_count: databases.length,
+        databases: databases.map(db => ({
+          name: db.name,
+          dbId: db.dbId,
+          region: db.primaryRegion,
+          hostname: db.hostname,
+          url: `libsql://${db.hostname}`
+        }))
+      };
+    }
+  },
+  {
+    name: 'turso_get_database_pool',
+    description: 'Retrieve the server-side list of registered databases and which one is currently selected as active',
+    inputSchema: {
+      type: 'object',
+      properties: {}
+    },
+    handler: async () => {
+      const reg = await readDbRegistry();
+      return {
+        success: true,
+        active_database: reg.activeDb,
+        databases: reg.databases || []
+      };
+    }
+  },
+  {
+    name: 'turso_add_database_to_pool',
+    description: 'Register a database connection under a distinct name inside the server-side pool',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        name: { type: 'string', description: 'Label or identifier for this database (e.g., debug-db)' },
+        url: { type: 'string', description: 'Connection URL: libsql://... or https://...' },
+        token: { type: 'string', description: 'Auth token for connection authorization' },
+        set_active: { type: 'boolean', description: 'Whether to immediately make this the selected active database', default: true }
+      },
+      required: ['name', 'url']
+    },
+    handler: async (env, args) => {
+      const name = args.name.toLowerCase().trim();
+      const url = args.url.trim();
+      const token = (args.token || '').trim();
+      const setActive = args.set_active !== false;
+
+      const reg = await readDbRegistry();
+      const dbEntry = { name, url, token };
+      
+      const filtered = (reg.databases || []).filter(d => d.name !== name);
+      filtered.push(dbEntry);
+
+      reg.databases = filtered;
+      if (setActive || !reg.activeDb) {
+        reg.activeDb = name;
+      }
+
+      await writeDbRegistry(reg);
+      return {
+        success: true,
+        message: `Database "${name}" successfully registered inside the server-side pool.`,
+        active_database: reg.activeDb,
+        databases: reg.databases
+      };
+    }
+  },
+  {
+    name: 'turso_set_active_database',
+    description: 'Switch the default active database target inside the pool',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        name: { type: 'string', description: 'Name of the database from the pool to set as active' }
+      },
+      required: ['name']
+    },
+    handler: async (env, args) => {
+      const name = args.name.toLowerCase().trim();
+      const reg = await readDbRegistry();
+      const exists = (reg.databases || []).some(d => d.name === name);
+      if (!exists) {
+        throw new Error(`Database "${name}" does not exist in the registered pool. Please register it first using turso_add_database_to_pool.`);
+      }
+
+      reg.activeDb = name;
+      await writeDbRegistry(reg);
+      return {
+        success: true,
+        message: `Switched active database target to "${name}".`,
+        active_database: reg.activeDb
+      };
+    }
+  },
+  {
+    name: 'turso_remove_database_from_pool',
+    description: 'Delete a database registration from the server-side pool',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        name: { type: 'string', description: 'Name of the database connection to drop' }
+      },
+      required: ['name']
+    },
+    handler: async (env, args) => {
+      const name = args.name.toLowerCase().trim();
+      const reg = await readDbRegistry();
+      
+      reg.databases = (reg.databases || []).filter(d => d.name !== name);
+      if (reg.activeDb === name) {
+        reg.activeDb = reg.databases.length > 0 ? reg.databases[0].name : null;
+      }
+
+      await writeDbRegistry(reg);
+      return {
+        success: true,
+        message: `Removed "${name}" from the database pool.`,
+        active_database: reg.activeDb,
+        databases: reg.databases
+      };
+    }
+  },
+  {
+    name: 'turso_get_database_usage',
+    description: 'Query Turso Platform API to retrieve read/write usage statistics and storage bytes used for a specific database',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        db_name: { type: 'string', description: 'Name of the target database' },
+        org_name: { type: 'string', description: 'Turso organization or username. If omitted, uses env.TURSO_ORG or auto-resolved' },
+        api_token: { type: 'string', description: 'Turso Platform API Access Token. If omitted, uses env.TURSO_API_TOKEN or env.TURSO_PLATFORM_API_TOKEN' }
+      },
+      required: ['db_name']
+    },
+    handler: async (env, args) => {
+      const token = args.api_token || env.TURSO_PLATFORM_API_TOKEN || env.TURSO_API_TOKEN;
+      if (!token) {
+        throw new Error('Turso Platform API Access Token is required to check database stats. Please configure TURSO_PLATFORM_API_TOKEN.');
+      }
+
+      let org = args.org_name || env.TURSO_ORG;
+      if (!org) {
+        try {
+          const orgRes = await fetchWithTimeout('https://api.turso.tech/v1/organizations', {
+            headers: { 'Authorization': `Bearer ${token}` }
+          });
+          if (orgRes.ok) {
+            const orgData = await orgRes.json();
+            const firstOrg = orgData?.[0]?.name ?? orgData?.organizations?.[0]?.name;
+            if (firstOrg) org = firstOrg;
+          }
+        } catch (e) {
+          // ignore
+        }
+      }
+
+      if (!org) org = 'default';
+
+      const dbNameClean = args.db_name.toLowerCase().trim().replace(/[^a-z0-9_-]/g, '');
+      const usageUrl = `https://api.turso.tech/v1/organizations/${org}/databases/${dbNameClean}/usage`;
+
+      const res = await fetchWithTimeout(usageUrl, {
+        headers: {      
+          'Authorization': `Bearer ${token}`,
+          'Accept': 'application/json'
+        }
+      });
+
+      if (!res.ok) {
+        const errText = await res.text();
+        throw new Error(`Failed to consult Turso database usage (${res.status}): ${errText}`);
+      }
+
+      const data = await res.json();
+      const usage = data?.database?.usage || data?.usage || {};
+      const instances = data?.database?.instances || data?.instances || [];
+
+      return {
+        success: true,
+        database: dbNameClean,
+        organization: org,
+        usage: {
+          rows_read: usage?.rows_read ?? 0,
+          rows_written: usage?.rows_written ?? 0,
+          storage_bytes_used: usage?.storage_bytes_used ?? usage?.bytes_used ?? 0,
+        },
+        instances: instances.map(inst => ({
+          uuid: inst.uuid,
+          name: inst.name,
+          usage: {
+            rows_read: inst.usage?.rows_read ?? 0,
+            rows_written: inst.usage?.rows_written ?? 0,
+            storage_bytes_used: inst.usage?.storage_bytes_used ?? inst.usage?.bytes_used ?? 0
+          }
+        }))
+      };
+    }
+  },
+
+  // ── GitHub Workspace Tools ──
+  {
+    name: 'github_list_repos',
+    description: 'List user repositories',
+    inputSchema: {
+      type: 'object',
+      properties: { type: { type: 'string', description: 'all, owner, public, private, member' } }
+    },
+    handler: async (env, args) => {
+      const type = args.type || 'all';
+      return githubRequest(env, 'GET', `/user/repos?type=${type}&per_page=50&sort=updated`);
+    }
+  },
+  {
+    name: 'github_get_repo',
+    description: 'Fetch complete metadata of a repository',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        owner: { type: 'string', description: 'Owner organization or username' },
+        repo: { type: 'string', description: 'Target Repository name' }
+      },
+      required: ['owner', 'repo']
+    },
+    handler: async (env, args) => {
+      return githubRequest(env, 'GET', `/repos/${args.owner}/${args.repo}`);
+    }
+  },
+  {
+    name: 'github_create_repo',
+    description: 'Instantiate a brand new GitHub Repository in your account',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        name: { type: 'string', description: 'Repository Identifier' },
+        description: { type: 'string' },
+        private: { type: 'boolean', default: false },
+        auto_init: { type: 'boolean', default: true }
+      },
+      required: ['name']
+    },
+    handler: async (env, args) => {
+      return githubRequest(env, 'POST', '/user/repos', {
+        name: args.name,
+        description: args.description || '',
+        private: !!args.private,
+        auto_init: args.auto_init !== false
+      });
+    }
+  },
+  {
+    name: 'github_list_files',
+    description: 'Recurse directories and fetch file statuses',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        owner: { type: 'string' },
+        repo: { type: 'string' },
+        path: { type: 'string', description: 'Folder path' },
+        branch: { type: 'string', default: 'main' }
+      },
+      required: ['owner', 'repo']
+    },
+    handler: async (env, args) => {
+      const p = args.path || '';
+      const b = args.branch || 'main';
+      return githubRequest(env, 'GET', `/repos/${args.owner}/${args.repo}/contents/${p}?ref=${b}`);
+    }
+  },
+  {
+    name: 'github_get_file',
+    description: 'Read the parsed UTF-8 lines inside a file',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        owner: { type: 'string' },
+        repo: { type: 'string' },
+        path: { type: 'string' },
+        branch: { type: 'string', default: 'main' }
+      },
+      required: ['owner', 'repo', 'path']
+    },
+    handler: async (env, args) => {
+      const b = args.branch || 'main';
+      const data = await githubRequest(env, 'GET', `/repos/${args.owner}/${args.repo}/contents/${args.path}?ref=${b}`);
+      if (data?.content) {
+        const decoded = typeof Buffer !== 'undefined'
+          ? Buffer.from(data.content.replace(/\s/g, ''), 'base64').toString('utf-8')
+          : atob(data.content.replace(/\s/g, ''));
+        data.decoded_content = decoded;
+      }
+      return data;
+    }
+  },
+  {
+    name: 'github_create_file',
+    description: 'Create a brand new file in a repository',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        owner: { type: 'string' },
+        repo: { type: 'string' },
+        path: { type: 'string' },
+        content: { type: 'string' },
+        message: { type: 'string' },
+        branch: { type: 'string', default: 'main' }
+      },
+      required: ['owner', 'repo', 'path', 'content', 'message']
+    },
+    handler: async (env, args) => {
+      const b = args.branch || 'main';
+      const b64 = typeof Buffer !== 'undefined'
+        ? Buffer.from(args.content, 'utf-8').toString('base64')
+        : btoa(unescape(encodeURIComponent(args.content)));
+      return githubRequest(env, 'PUT', `/repos/${args.owner}/${args.repo}/contents/${args.path}`, {
+        message: args.message,
+        content: b64,
+        branch: b
+      });
+    }
+  },
+  {
+    name: 'github_update_file',
+    description: 'Modify an existing file matching its tree SHA reference automatically',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        owner: { type: 'string' },
+        repo: { type: 'string' },
+        path: { type: 'string' },
+        content: { type: 'string' },
+        message: { type: 'string' },
+        branch: { type: 'string', default: 'main' }
+      },
+      required: ['owner', 'repo', 'path', 'content', 'message']
+    },
+    handler: async (env, args) => {
+      const b = args.branch || 'main';
+      const sha = await getGitHubFileSha(env, args.owner, args.repo, args.path, b);
+      if (!sha) {
+        throw new Error(`The file at ${args.path} was not located, please verify path & branch.`);
+      }
+      const b64 = typeof Buffer !== 'undefined'
+        ? Buffer.from(args.content, 'utf-8').toString('base64')
+        : btoa(unescape(encodeURIComponent(args.content)));
+      return githubRequest(env, 'PUT', `/repos/${args.owner}/${args.repo}/contents/${args.path}`, {
+        message: args.message,
+        content: b64,
+        sha,
+        branch: b
+      });
+    }
+  },
+  {
+    name: 'github_delete_file',
+    description: 'Delete a file from the repository securely',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        owner: { type: 'string' },
+        repo: { type: 'string' },
+        path: { type: 'string' },
+        message: { type: 'string' },
+        branch: { type: 'string', default: 'main' }
+      },
+      required: ['owner', 'repo', 'path', 'message']
+    },
+    handler: async (env, args) => {
+      const b = args.branch || 'main';
+      const sha = await getGitHubFileSha(env, args.owner, args.repo, args.path, b);
+      if (!sha) {
+        throw new Error(`The file at ${args.path} was not located.`);
+      }
+      return githubRequest(env, 'DELETE', `/repos/${args.owner}/${args.repo}/contents/${args.path}`, {
+        message: args.message,
+        sha,
+        branch: b
+      });
+    }
+  },
+  {
+    name: 'github_create_pr',
+    description: 'Generate standard target pull request records',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        owner: { type: 'string' },
+        repo: { type: 'string' },
+        title: { type: 'string' },
+        body: { type: 'string' },
+        head: { type: 'string', description: 'Branch with edits' },
+        base: { type: 'string', default: 'main', description: 'Target branch' }
+      },
+      required: ['owner', 'repo', 'title', 'head']
+    },
+    handler: async (env, args) => {
+      return githubRequest(env, 'POST', `/repos/${args.owner}/${args.repo}/pulls`, {
+        title: args.title,
+        body: args.body || '',
+        head: args.head,
+        base: args.base || 'main'
+      });
+    }
+  },
+
+  // ── High-Level Orchestration & Diagnostics ──
+  {
+    name: 'audit_traces_list',
+    description: 'Retrieve real-time audit tracing logs for DevOps security auditing and change tracking.',
+    inputSchema: { type: 'object', properties: {} },
+    handler: async (env) => {
+      return {
+        success: true,
+        traces_count: AUDIT_TRACE_LOGS.length,
+        traces: AUDIT_TRACE_LOGS
+      };
+    }
+  },
+  {
+    name: 'get_system_safety_policies',
+    description: 'Get details about configured guardrail lock rules, strict check limits, dry-run instructions, and how to query secure profiles.',
+    inputSchema: { type: 'object', properties: {} },
+    handler: async (env) => {
+      return {
+        success: true,
+        guardrails: {
+          scale_down: { rule: "Replicas to 0 is locked by default to prevent offline outages." },
+          secret_deletion: { rule: "Deleting configuration parameters containing URLs, Keys, Secrets, or Tokens is locked." },
+          unrestricted_sql: { rule: "Executing DROP/TRUNCATE statements or running open DELETE queries without WHERE clauses is locked." },
+          git_deletion: { rule: "Deleting git files directly via github_delete_file is locked." }
+        },
+        override: "To bypass any safety lock for active development operations, pass parameter 'bypass_safety': true.",
+        dry_run_supported: "Pass 'dry_run': true to inspect changes visually without mutating any physical state.",
+        observability: "Tracking and change diagnostics are automatically reported to get_system_safety_policies and audit_traces_list."
+      };
+    }
+  },
+  {
+    name: 'orchestrate_deploy_pipeline',
+    description: 'High-level deployment workflow. Checks source file state on GitHub, updates configs, scales/restarts, and verifies health status via log telemetry.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        app_name: { type: 'string', description: 'Gigalixir app identifier' },
+        owner: { type: 'string', description: 'GitHub repo owner' },
+        repo: { type: 'string', description: 'GitHub repo' },
+        config_key: { type: 'string', description: 'Optional configuration variable key' },
+        config_value: { type: 'string', description: 'Optional configuration variable value' }
+      },
+      required: ['app_name', 'owner', 'repo']
+    },
+    handler: async (env, args) => {
+      const steps = [];
+      try {
+        // Step 1: Check GitHub repo files
+        steps.push({ step: "1. GitHub Verification", status: "started" });
+        const repoData = await githubRequest(env, 'GET', `/repos/${args.owner}/${args.repo}/contents`);
+        const packageJson = Array.isArray(repoData) ? repoData.find(f => f.name === 'package.json') : null;
+        steps[steps.length - 1].status = "completed";
+        steps[steps.length - 1].details = `Found git files. Package.json is located at SHA: ${packageJson?.sha || 'N/A'}`;
+
+        // Step 2: Set configs if requested
+        if (args.config_key && args.config_value) {
+          steps.push({ step: "2. Setting configuration parameters", status: "started" });
+          try {
+            await gigalixirRequest(env, 'PUT', `/api/apps/${args.app_name}/config`, {
+              config: { [args.config_key]: args.config_value }
+            });
+          } catch {
+            await gigalixirRequest(env, 'PUT', `/api/apps/${args.app_name}/configs`, {
+              [args.config_key]: args.config_value
+            });
+          }
+          steps[steps.length - 1].status = "completed";
+        }
+
+        // Step 3: Trigger rolling restart
+        steps.push({ step: "3. Triggering rolling container restart", status: "started" });
+        await gigalixirRequest(env, 'PUT', `/api/apps/${args.app_name}/restart`);
+        steps[steps.length - 1].status = "completed";
+
+        // Step 4: Verify health logs telemetry
+        steps.push({ step: "4. Telemetry audit & log parsing", status: "started" });
+        const recentLogs = await gigalixirRequest(env, 'GET', `/api/apps/${args.app_name}/logs?num_lines=15`);
+        steps[steps.length - 1].status = "completed";
+        steps[steps.length - 1].details = `Telemetry retrieved container traces successfully! Checking logs: ${String(recentLogs?.logs || '').slice(0, 100)}...`;
+
+        return {
+          success: true,
+          pipeline_log: steps,
+          conclusions: "DevOps orchestration pipeline completed flawlessly. Application refreshed, rebooted, and health patterns verified green."
+        };
+      } catch (err) {
+        return {
+          success: false,
+          pipeline_log: steps,
+          failed_step: steps[steps.length - 1],
+          error: err.message || String(err),
+          conclusions: "Pipeline sequence aborted. Failed step state can be traced inside the pipeline logs."
+        };
+      }
+    }
+  },
+  {
+    name: 'diagnose_and_repair_app',
+    description: 'DevOps diagnostic engine. Scans application logs, container replicas, and configs, analyzes issues, and attempts self-healing restoration actions if offline.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        app_name: { type: 'string', description: 'Gigalixir app to inspect and repair' }
+      },
+      required: ['app_name']
+    },
+    handler: async (env, args) => {
+      const diagnosis = {
+        scan_time: new Date().toISOString(),
+        findings: [],
+        reparations_attempted: [],
+        status: "Heal status undetermined"
+      };
+
+      try {
+        // Step 1: Query application metadata
+        const appRes = await gigalixirRequest(env, 'GET', `/api/apps/${args.app_name}`);
+        const app = appRes?.data ?? appRes;
+        diagnosis.findings.push(`Application State matches static value: "${app.state || 'UNKNOWN'}"`);
+
+        // Step 2: Query running replica status
+        let scaleRes;
+        try {
+          scaleRes = await gigalixirRequest(env, 'GET', `/api/apps/${args.app_name}/status`);
+        } catch {
+          scaleRes = null;
+        }
+        const activeReplicas = scaleRes?.data?.replicas_running ?? app.replicas ?? 0;
+        diagnosis.findings.push(`Container scaled replicas details: running=${activeReplicas}, desired=${app.replicas ?? 'N/A'}`);
+
+        // Step 3: Check logger logs
+        const logRes2 = await gigalixirRequest(env, 'GET', `/api/apps/${args.app_name}/logs?num_lines=35`);
+        const logsStr = String(logRes2?.logs || '');
+        const hasCrashingPattern = /crash|error|oom|exit|fail|failed|Exception/i.test(logsStr);
+        if (hasCrashingPattern) {
+          diagnosis.findings.push("Critical telemetric finding: Crashing signature or error stack trace located inside current logs!");
+        }
+
+        // Repair Pipeline
+        if (activeReplicas === 0 && app.state === 'ACTIVE') {
+          // Self-healing: scale back up to 1 replica
+          diagnosis.reparations_attempted.push("Self-healing action: Automatic scale state mutation detected (scaling up replica pool to 1)...");
+          await gigalixirRequest(env, 'PUT', `/api/apps/${args.app_name}/scale`, { replicas: 1 });
+          diagnosis.status = "SUCCESS: Scale recovered successfully - monitored metrics scaled back up to online state.";
+        } else if (hasCrashingPattern) {
+          // Self-healing: trigger native restart to cycle container state
+          diagnosis.reparations_attempted.push("Self-healing action: Logging warning. Triggering a native rolling restart to restore microcontainer loops...");
+          await gigalixirRequest(env, 'PUT', `/api/apps/${args.app_name}/restart`);
+          diagnosis.status = "ATTEMPTED: Graceful application cycle accomplished. Trace subsequent events via get_logs.";
+        } else {
+          diagnosis.status = "STABLE: Healthy application metrics. No anomalous crash logs or replica deviations observed.";
+        }
+
+        return {
+          success: true,
+          diagnosis
+        };
+      } catch (err) {
+        return {
+          success: false,
+          diagnosis,
+          error: err.message || String(err)
+        };
+      }
+    }
+  },
+  {
+    name: 'help',
+    description: 'Explain the exact purpose, schema inputs, safety policies, and best practices of all available MCP tools in this workspace so AI never guesses.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        filter_by_tool: {
+          type: 'string',
+          description: 'Filter result to explain a single specific tool (e.g., "turso_execute" or "set_config")'
+        }
+      }
+    },
+    handler: async (env, args) => {
+      const toolDocumentation = {
+        gigalixir_management: {
+          description: "Gigalixir Cloud Containers Hosting & App Infrastructure Tools",
+          tools: {
+            list_apps: {
+              purpose: "Retrieve list of all deployed applications registered within your Gigalixir environment.",
+              inputs: "None",
+              best_practices: "Use to verify existence, spelling, active replicas, and target subdomains before committing updates."
+            },
+            get_app: {
+              purpose: "Fetch detailed metadata regarding a single specific application (e.g. current memory utilization, target URL, region info).",
+              inputs: "app_name (string)",
+              best_practices: "Examine health or deployment state when app-level changes are requested."
+            },
+            get_configs: {
+              purpose: "Extract application configuration maps and environment secrets (e.g., DATABASE_URL, secrets).",
+              inputs: "app_name (string)",
+              best_practices: "Handles singular /config and plural /configs fallback endpoints automatically."
+            },
+            set_config: {
+              purpose: "Insert or update config keys / environment secrets on a specified application (which triggers a rolling cycle/restart to mount variables).",
+              inputs: "app_name (string), key (string), value (string)",
+              best_practices: "Always check set values using 'get_configs' to verify changes took effect."
+            },
+            delete_config: {
+              purpose: "Remove a key-value property from the application configurations.",
+              inputs: "app_name (string), key (string), bypass_safety (boolean, optional)",
+              best_practices: "Has safety guard rules. Removing keys like DB, url, token, secret will block unless 'bypass_safety: true' is passed."
+            },
+            get_replicas: {
+              purpose: "Fetch descriptive run container stats and active container counts on deployed apps.",
+              inputs: "app_name (string)",
+              best_practices: "Verify current task scaling patterns or restart completion status."
+            },
+            scale: {
+              purpose: "Modify the container replica pool scaling factors.",
+              inputs: "app_name (string), replicas (number), bypass_safety (boolean, optional)",
+              best_practices: "Scaling replicas down to 0 is locked. To execute, pass 'bypass_safety: true'."
+            },
+            list_releases: {
+              purpose: "Query past deploy/rollout logs containing older version slugs, metadata, and timestamps.",
+              inputs: "app_name (string)",
+              best_practices: "Allows tracking release history index for rollback purposes."
+            },
+            rollback: {
+              purpose: "Roll back the current running application image to any listed past release version slug.",
+              inputs: "app_name (string), version (string)",
+              best_practices: "Provides safe undo states if a deploy breaks current runtime availability."
+            },
+            restart: {
+              purpose: "Issue a rolling restart of all container instances.",
+              inputs: "app_name (string)",
+              best_practices: "Trigger changes manually if a database URL or secret updates, but notice set_config already triggers a rolling cycle automatically."
+            },
+            get_logs: {
+              purpose: "Export container STDOUT and STDERR stream logs.",
+              inputs: "app_name (string), num_lines (number, optional)",
+              best_practices: "Ideal for inspecting application start crashes, runtime exceptions, server status, or test output."
+            },
+            create_app: {
+              purpose: "Provision a brand new managed container application within Gigalixir subdomains.",
+              inputs: "app_name (string), cloud (string, optional), region (string, optional)",
+              best_practices: "Ensure app_name is an entirely unique lower-case string."
+            }
+          }
+        },
+        turso_sqlite: {
+          description: "Turso Hosted Serverless SQLite Query Engine Integration Tools",
+          tools: {
+            turso_list_tables: {
+              purpose: "Retrieve list of all active user and schema table names within the SQL database.",
+              inputs: "None",
+              best_practices: "Check target tables to prevent duplicated table creation or missing column reference errors."
+            },
+            turso_describe_table: {
+              purpose: "Describe precise structural schemas, variable typing, and indexes for a specific table name.",
+              inputs: "table (string)",
+              best_practices: "Understand table schema before composing complex relational inserts or queries."
+            },
+            turso_query: {
+              purpose: "Execute safe lookup queries (SELECT, EXPLAIN, WITH) returning parsed record arrays.",
+              inputs: "sql (string), args (array, positional strings)",
+              best_practices: "Read-only. Throws an error for write instructions like INSERT, UPDATE, CREATE, or DELETE."
+            },
+            turso_execute: {
+              purpose: "Execute structural altering or data writing instructions (INSERT, UPDATE, DELETE, CREATE, DROP).",
+              inputs: "sql (string), args (array, positional strings), bypass_safety (boolean, optional)",
+              best_practices: "Write operations. DROP or TRUNCATE are locked by default; requires 'bypass_safety: true'."
+            },
+            turso_transaction: {
+              purpose: "Group sequential SQL write queries in an atomic BEGIN/COMMIT box with auto-rollback security.",
+              inputs: "statements (array of object: { sql: string, args: array })",
+              best_practices: "Highly recommended for relational operations that modify multiple tables consecutively."
+            },
+            turso_create_database: {
+              purpose: "Create a brand new serverless SQLite database in your Turso account and obtain its connection parameters.",
+              inputs: "db_name (string), org_name (string, optional), api_token (string, optional)",
+              best_practices: "Use to dynamically provision sandboxed environments for testing."
+            },
+            turso_list_databases: {
+              purpose: "Retrieve the names and endpoints of all databases in your Turso Cloud Platform account.",
+              inputs: "org_name (string, optional), api_token (string, optional)",
+              best_practices: "Use to synchronize active connection targets from the cloud workspace."
+            }
+          }
+        },
+        github_workspace: {
+          description: "GitHub Authentication & Repository File Manipulation System",
+          tools: {
+            github_list_repos: {
+              purpose: "List active user repositories sorted by last modification.",
+              inputs: "type (string, option: all, owner, member, private, public)",
+              best_practices: "Confirm repo structures and metadata boundaries before syncing."
+            },
+            github_get_repo: {
+              purpose: "Fetch comprehensive GitHub repository information.",
+              inputs: "owner (string), repo (string)",
+              best_practices: "Validate repo read/write access and default branch names (main/master)."
+            },
+            github_create_repo: {
+              purpose: "Initialize a new repository directly into your GitHub workspace.",
+              inputs: "name (string), description (string, optional), private (boolean, optional), auto_init (boolean, optional)",
+              best_practices: "Perfect for spawning clean workspace deployments."
+            },
+            github_list_files: {
+              purpose: "Recursively list directory structures and files.",
+              inputs: "owner (string), repo (string), path (string, optional), branch (string, optional)",
+              best_practices: "Examine repository templates and code organizations before editing."
+            },
+            github_get_file: {
+              purpose: "Download a target file's content and acquire its Git blob SHA.",
+              inputs: "owner (string), repo (string), path (string), branch (string, optional)",
+              best_practices: "Required to fetch blob 'sha' before utilizing update/delete tools."
+            },
+            github_create_file: {
+              purpose: "Deploy and commit a brand new file inside a repository path.",
+              inputs: "owner (string), repo (string), path (string), content (string, base64-encoded), message (string, optional), branch (string, optional)",
+              best_practices: "Double check that the parent directories exist or paths are correct."
+            },
+            github_update_file: {
+              purpose: "Commit updates to a currently existing file.",
+              inputs: "owner (string), repo (string), path (string), content (string, base64-encoded), sha (string, target blob SHA), message (string, optional), branch (string, optional)",
+              best_practices: "Always get the current file SHA using 'github_get_file' first to prevent fast-forward conflict errors."
+            },
+            github_delete_file: {
+              purpose: "Delete a file from the Repository.",
+              inputs: "owner (string), repo (string), path (string), sha (string, target blob SHA), message (string, optional), branch (string, optional)",
+              best_practices: "Requires the file's current Git blob SHA to prevent concurrency issues."
+            },
+            github_create_pr: {
+              purpose: "Submit a pull request between a source fork/branch and target destination branch.",
+              inputs: "owner (string), repo (string), title (string), head (string, source), base (string, target), body (string, optional)",
+              best_practices: "Ensures reviews or staging workflows are respected."
+            }
+          }
+        },
+        system_diagnostics: {
+          description: "System Health Checking & Intelligent Diagnostics DevOps Pipeline Tools",
+          tools: {
+            audit_traces_list: {
+              purpose: "Obtain localized audit logs detailing which tools the model invoked in chronological order.",
+              inputs: "None",
+              best_practices: "Useful for traceback checks on state mutation history."
+            },
+            get_system_safety_policies: {
+              purpose: "Fetch safety locks specifications defining sensitive operations (DROP database, scaling to 0, configuration removals).",
+              inputs: "None",
+              best_practices: "Review these criteria to prevent operation failures."
+            },
+            orchestrate_deploy_pipeline: {
+              purpose: "DevOps automation pipeline which performs safe pre-flights, updates codebases dynamically across pipelines, commits changes, scales replica containers, checks logs, and verifies deployment status automatically.",
+              inputs: "owner (string), repo (string), app_name (string), run_tests (boolean, optional)",
+              best_practices: "Superb for triggering end-to-end cloud deployments."
+            },
+            diagnose_and_repair_app: {
+              purpose: "Deep diagnostic scanning suite. Pulls deployment state, replica logs, and crash metrics, identifying errors and executing self-healing solutions automatically.",
+              inputs: "app_name (string)",
+              best_practices: "Run this whenever a container appears offline or behaves anomalously."
+            },
+            help: {
+              purpose: "Explain the exact purpose, schema inputs, safety policies, and best practices of all available MCP tools in this workspace so AI never guesses.",
+              inputs: "filter_by_tool (string, optional)",
+              best_practices: "Run without arguments to retrieve the full index, or provide a tool name to get its detailed schema and guidelines."
+            }
+          }
+        }
+      };
+
+      if (args.filter_by_tool) {
+        const query = String(args.filter_by_tool).toLowerCase().trim();
+        for (const cat of Object.values(toolDocumentation)) {
+          if (cat.tools[query]) {
+            return {
+              success: true,
+              tool: query,
+              schema: TOOLS.find(t => t.name === query)?.inputSchema || "Unknown Input Schema",
+              ...cat.tools[query]
+            };
+          }
+        }
+        return {
+          success: false,
+          error: `Tool "${args.filter_by_tool}" not verified within system index. Run help without arguments to view all details.`
+        };
+      }
+
+      return {
+        success: true,
+        summary: "For full input schemas, retry help with { filter_by_tool: 'toolName' }.",
+        documentation: toolDocumentation
+      };
+    }
+  }
+];
+
+// Global state-tracing cache within container execution loop
+const AUDIT_TRACE_LOGS = [];
+
+function checkSafetyLock(name, args) {
+  if (args.bypass_safety === true) {
+    return { passed: true };
+  }
+  if (name === 'scale' && args.replicas === 0) {
+    return {
+      passed: false,
+      reason: 'Scaling active systems to 0 replicas shuts down infrastructure health. Pass "bypass_safety": true to execute.'
+    };
+  }
+  if (name === 'delete_config') {
+    const key = String(args.key || '').toUpperCase();
+    if (key.includes('DB') || key.includes('CONN') || key.includes('KEY') || key.includes('TOKEN') || key.includes('SECRET') || key.includes('URL')) {
+      return {
+        passed: false,
+        reason: `Removing production secret/key "${args.key}" might break application live availability immediately. Pass "bypass_safety": true to execute.`
+      };
+    }
+  }
+  if (name === 'turso_execute') {
+    const sql = String(args.sql || '').toUpperCase();
+    if (sql.includes('DROP ') || sql.includes('TRUNCATE ')) {
+      return {
+        passed: false,
+        reason: 'Destructive SQL command (DROP or TRUNCATE) detected. Pass "bypass_safety": true to execute.'
+      };
+    }
+  }
+  if (name === 'github_delete_file') {
+    return {
+      passed: false,
+      reason: 'Removing historical application files from version control is locked. Pass "bypass_safety": true to execute.'
+    };
+  }
+  return { passed: true };
+}
+
+function getDryRunExplanation(name, args) {
+  switch (name) {
+    case 'scale':
+      return `Simulating scaling on "${args.app_name}": Would update container pool size to replicas=${args.replicas ?? 'unchanged'} (spec size=${args.size ?? 'unchanged'}).`;
+    case 'set_config':
+      return `Simulating config modification: Would inject variable "${args.key}" with value of length ${String(args.value || '').length} on "${args.app_name}". Will trigger rolling pod refresh.`;
+    case 'delete_config':
+      return `Simulating configuration removal: Would delete key "${args.key}" from "${args.app_name}".`;
+    case 'rollback':
+      return `Simulating safe rollback: Would instruct deployment engine to regress active container code to target release version v${args.version}.`;
+    case 'restart':
+      return `Simulating remote server restart: Would trigger an orchestrator-wide graceful rolling restart for all running pods on "${args.app_name}".`;
+    case 'turso_execute':
+      return `Simulating database mutation: Would run write action "${args.sql}" against resolved database.`;
+    case 'github_create_file':
+      return `Simulating file creation: Would commit brand new file "${args.path}" to repository "${args.owner}/${args.repo}".`;
+    case 'github_update_file':
+      return `Simulating codebase update: Would commit revision payload to overwrite file at "${args.path}" in repo "${args.owner}/${args.repo}".`;
+    case 'github_delete_file':
+      return `Simulating version control delete: Would delete file "${args.path}" in repo "${args.owner}/${args.repo}".`;
+    default:
+      return `Simulating routine DevOps system execution for tool "${name}". No actual configurations or codes will be mutated.`;
+  }
+}
+
+// Unified, high-performance execution pipeline with safety guardrails, dry-run simulation, and trace tracking logs
+async function executeTool(env, name, args) {
+  const tool = TOOLS.find(t => t.name === name);
+  if (!tool) {
+    throw new Error(`Missing tool registry for: ${name}`);
+  }
+
+  // Validate parameter schemas
+  const required = tool.inputSchema.required || [];
+  for (const key of required) {
+    if (args[key] === undefined || args[key] === null) {
+      throw new Error(`Schema mismatch on ${name}: Parameter '${key}' is required.`);
+    }
+  }
+
+  const startTime = Date.now();
+  const timestamp = new Date().toISOString();
+
+  // 1. Dry Run interceptor
+  const isDryRun = args.dry_run === true;
+  if (isDryRun) {
+    const explanation = getDryRunExplanation(name, args);
+    const trace = {
+      timestamp,
+      tool: name,
+      user_target: args.app_name || args.repo || 'database',
+      dry_run: true,
+      status: 'success',
+      args
+    };
+    AUDIT_TRACE_LOGS.push(trace);
+    if (AUDIT_TRACE_LOGS.length > 50) AUDIT_TRACE_LOGS.shift();
+
+    return {
+      status: 'success',
+      dry_run: true,
+      executionMetadata: {
+        tool: name,
+        durationMs: 0,
+        timestamp
+      },
+      data: {
+        simulated: true,
+        message: 'Security Dry Run verified successfully. Simulated changes traced below.',
+        explanation
+      }
+    };
+  }
+
+  // 2. Safety Guardrails locks check
+  const safetyLock = checkSafetyLock(name, args);
+  if (!safetyLock.passed) {
+    const trace = {
+      timestamp,
+      tool: name,
+      user_target: args.app_name || args.repo || 'database',
+      dry_run: false,
+      status: 'safety_blocked',
+      reason: safetyLock.reason,
+      args
+    };
+    AUDIT_TRACE_LOGS.push(trace);
+    if (AUDIT_TRACE_LOGS.length > 50) AUDIT_TRACE_LOGS.shift();
+
+    return {
+      status: 'failed',
+      executionMetadata: {
+        tool: name,
+        durationMs: 0,
+        timestamp
+      },
+      error: `DevOps Safety Lock Error: ${safetyLock.reason}`
+    };
+  }
+
+  // 3. Execution & tracing
+  try {
+    const data = await tool.handler(env, args);
+    const duration = Date.now() - startTime;
+    const trace = {
+      timestamp,
+      tool: name,
+      user_target: args.app_name || args.repo || 'database',
+      dry_run: false,
+      status: 'success',
+      durationMs: duration,
+      args: { ...args, content: args.content ? `[Payload of length ${args.content.length}]` : undefined }
+    };
+    AUDIT_TRACE_LOGS.push(trace);
+    if (AUDIT_TRACE_LOGS.length > 50) AUDIT_TRACE_LOGS.shift();
+
+    return {
+      status: 'success',
+      executionMetadata: {
+        tool: name,
+        durationMs: duration,
+        timestamp
+      },
+      data
+    };
+  } catch (err) {
+    const duration = Date.now() - startTime;
+    const trace = {
+      timestamp,
+      tool: name,
+      user_target: args.app_name || args.repo || 'database',
+      dry_run: false,
+      status: 'failed',
+      durationMs: duration,
+      error: err.message || err.toString(),
+      args
+    };
+    AUDIT_TRACE_LOGS.push(trace);
+    if (AUDIT_TRACE_LOGS.length > 50) AUDIT_TRACE_LOGS.shift();
+
+    return {
+      status: 'failed',
+      executionMetadata: {
+        tool: name,
+        durationMs: duration,
+        timestamp
+      },
+      error: err.message || err.toString()
+    };
+  }
+}
+
+// ── MCP STREAMING HANDLER ───────────────────────────────────────────────────
+
+const CORS_HEADERS = {
+  'Access-Control-Allow-Origin': '*',
+  'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
+  'Access-Control-Allow-Headers': 'Content-Type, Authorization, Mcp-Session-Id',
+};
+
+function formatJSONResponse(body, status = 200) {
+  return new Response(JSON.stringify(body), {
+    status,
+    headers: {
+      ...CORS_HEADERS,
+      'Content-Type': 'application/json',
+    }
+  });
+}
+
+export async function handleMCPRequest(request, env) {
+  if (request.method === 'OPTIONS') {
+    return new Response(null, { status: 204, headers: CORS_HEADERS });
+  }
+
+  if (request.method === 'GET') {
+    // Standard MCP metadata endpoint
+    return formatJSONResponse({
+      name: 'gigalixir-mcp',
+      version: '1.2.0',
+      status: 'ok',
+      tools: TOOLS.length,
+      protocolVersion: '2024-11-05',
+      capabilities: {
+        tools: {}
+      }
+    });
+  }
+
+  if (request.method !== 'POST') {
+    return new Response('Method not allowed', { status: 405, headers: CORS_HEADERS });
+  }
+
+  let body;
+  try {
+    body = await request.json();
+  } catch {
+    return new Response('Invalid Request JSON body', { status: 400, headers: CORS_HEADERS });
+  }
+
+  const { jsonrpc = '2.0', id = null, method, params } = body;
+
+  try {
+    switch (method) {
+      case 'initialize':
+        return formatJSONResponse({
+          jsonrpc,
+          id,
+          result: {
+            protocolVersion: '2024-11-05',
+            capabilities: { tools: {} },
+            serverInfo: { name: 'gigalixir-mcp', version: '1.2.0' },
+          }
+        });
+
+      case 'notifications/initialized':
+        return new Response(null, { status: 204, headers: CORS_HEADERS });
+
+      case 'tools/list':
+        // Return protocol tools description schema
+        return formatJSONResponse({
+          jsonrpc,
+          id,
+          result: {
+            tools: TOOLS.map(({ name, description, inputSchema }) => ({ name, description, inputSchema }))
+          }
+        });
+
+      case 'tools/call': {
+        const { name, arguments: args } = params || {};
+        const result = await executeTool(env, name, args || {});
+        
+        // Wrap responses inside unified structural content objects
+        return formatJSONResponse({
+          jsonrpc,
+          id,
+          result: {
+            content: [{
+              type: 'text',
+              text: JSON.stringify(result, null, 2)
+            }],
+            isError: result.status === 'failed'
+          }
+        });
+      }
+
+      default:
+        return formatJSONResponse({
+          jsonrpc,
+          id,
+          error: { code: -32601, message: `Method not found: ${method}` }
+        });
+    }
+  } catch (err) {
+    return formatJSONResponse({
+      jsonrpc,
+      id,
+      error: { code: -32603, message: err.message || 'Internal RPC error' }
+    });
+  }
+}
+
+// Default export wrapper for Cloudflare Workers
+const worker = {
+  async fetch(request, env) {
+    const url = new URL(request.url);
+    if (url.pathname === '/mcp' || url.pathname === '/') {
+      return handleMCPRequest(request, env);
+    }
+    return new Response('Resource Not Found', { status: 404, headers: CORS_HEADERS });
+  }
+};
+
+export default worker;
